@@ -1,0 +1,1654 @@
+import customtkinter as ctk
+from tkinter import ttk, messagebox, filedialog
+import pyperclip
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from cloudflare_api import CloudflareAPI
+from config_manager import ConfigManager
+from s3_api import S3API
+
+# Appearance settings
+ctk.set_appearance_mode("System")  # Modes: "System" (standard), "Dark", "Light"
+ctk.set_default_color_theme("blue")  # Themes: "blue" (standard), "green", "dark-blue"
+
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("Cloud Management Pro")
+        self.geometry("1000x800")
+
+        # Configure grid layout
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        # Variables
+        self.api = None
+        self.zone_id = None
+        self.s3_api = None
+        
+        # Load config
+        config = ConfigManager.load_config()
+        self.token_var = ctk.StringVar(value=config.get("token", ""))
+        self.domain_var = ctk.StringVar(value=config.get("domain", ""))
+        self.subdomain_var = ctk.StringVar()
+        self.ip_var = ctk.StringVar()
+        self.type_var = ctk.StringVar(value="A")
+        self.selected_record_id = None
+        self.zones_data = [] # Store full zone objects
+        self.current_records = [] # Store full record objects
+
+        # Extra Record Vars
+        self.proxied_var = ctk.BooleanVar(value=False)
+        self.ttl_var = ctk.StringVar(value="Auto")
+
+        self.ttl_mapping = {
+            "Auto": 1,
+            "1 min": 60,
+            "2 min": 120,
+            "5 min": 300,
+            "10 min": 600,
+            "15 min": 900,
+            "30 min": 1800,
+            "1 hr": 3600,
+            "2 hr": 7200,
+            "5 hr": 18000,
+            "12 hr": 43200,
+            "1 day": 86400
+        }
+        # Reverse mapping for display
+        self.ttl_reverse_mapping = {v: k for k, v in self.ttl_mapping.items()}
+
+        # AWS Variables
+        self.aws_access_key_var = ctk.StringVar()
+        self.aws_secret_key_var = ctk.StringVar()
+        self.aws_region_var = ctk.StringVar(value="us-east-1")
+        self.bucket_name_var = ctk.StringVar()
+        self.aws_profile_var = ctk.StringVar() # For the profile combobox
+
+        # Website Hosting Vars
+        self.enable_hosting_var = ctk.BooleanVar(value=True)
+        self.index_doc_var = ctk.StringVar(value="index.html")
+        self.error_doc_var = ctk.StringVar(value="404.html")
+        self.bucket_endpoint_var = ctk.StringVar(value="-")
+        self.bucket_search_var = ctk.StringVar()
+        self.obj_search_var = ctk.StringVar()
+        self.website_status_var = ctk.StringVar(value="-")
+        self.website_endpoint_var = ctk.StringVar(value="-")
+        self.versioning_status_var = ctk.StringVar(value="-")
+        
+        # Cloudflare Integration Vars
+        self.link_cf_var = ctk.BooleanVar(value=False)
+        self.cf_subdomain_var = ctk.StringVar()
+        self.cf_proxy_var = ctk.BooleanVar(value=True)
+        
+        # Status Bar Vars
+        self.status_var = ctk.StringVar(value="Ready")
+        self.progress_var = ctk.DoubleVar(value=0)
+        
+        # Store full lists for filtering
+        self.all_buckets = []
+        self.all_objects = []
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        # Create Tabview
+        self.tabview = ctk.CTkTabview(self, corner_radius=10)
+        self.tabview.grid(row=0, column=0, padx=20, pady=20, sticky="nsew")
+        
+        self.tabview.add("Cloudflare DNS")
+        self.tabview.add("AWS S3")
+        
+        self.setup_cloudflare_tab()
+        self.setup_s3_tab()
+
+        # Status Bar
+        self.status_bar = ctk.CTkFrame(self, height=30, corner_radius=0, fg_color="#1E1E1E")
+        self.status_bar.grid(row=1, column=0, sticky="ew")
+        self.status_bar.grid_columnconfigure(0, weight=1)
+
+        self.status_label = ctk.CTkLabel(self.status_bar, textvariable=self.status_var, font=ctk.CTkFont(size=12))
+        self.status_label.grid(row=0, column=0, padx=20, pady=2, sticky="w")
+
+        self.progress_bar = ctk.CTkProgressBar(self.status_bar, variable=self.progress_var, width=200, height=10)
+        self.progress_bar.grid(row=0, column=1, padx=20, pady=2, sticky="e")
+        self.progress_bar.set(0)
+
+    def set_status(self, text, progress=None):
+        def update():
+            self.status_var.set(text)
+            if progress is not None:
+                self.progress_var.set(progress)
+                if progress >= 1.0 or progress < 0:
+                    self.progress_bar.configure(mode="indeterminate")
+                    if progress >= 1.0: self.progress_bar.stop()
+                    else: self.progress_bar.start()
+                else:
+                    self.progress_bar.configure(mode="determinate")
+            else:
+                self.progress_bar.set(0)
+                self.progress_bar.configure(mode="determinate")
+        self.after(0, update)
+
+    def setup_cloudflare_tab(self):
+        tab = self.tabview.tab("Cloudflare DNS")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(2, weight=1)
+
+        # --- Top Section: Configuration ---
+        self.config_frame = ctk.CTkFrame(tab, corner_radius=10)
+        self.config_frame.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="nsew")
+        self.config_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(self.config_frame, text="Cloudflare Settings", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, columnspan=3, padx=20, pady=10, sticky="w")
+
+        ctk.CTkLabel(self.config_frame, text="API Token:").grid(row=1, column=0, padx=20, pady=5, sticky="e")
+        self.token_entry = ctk.CTkEntry(self.config_frame, textvariable=self.token_var, width=300, show="*", placeholder_text="Cloudflare API Token")
+        self.token_entry.grid(row=1, column=1, padx=20, pady=5, sticky="w")
+        self.token_entry.bind("<FocusOut>", lambda e: self.load_zones())
+        self.token_entry.bind("<Return>", lambda e: self.load_zones())
+
+        ctk.CTkLabel(self.config_frame, text="Select Domain:").grid(row=2, column=0, padx=20, pady=5, sticky="e")
+        self.domain_combo = ctk.CTkComboBox(self.config_frame, variable=self.domain_var, width=300, values=["Please enter API token..."], command=self.on_domain_change)
+        self.domain_combo.grid(row=2, column=1, padx=20, pady=5, sticky="w")
+
+
+        self.save_btn = ctk.CTkButton(self.config_frame, text="Load Domains", command=self.load_zones, width=120)
+        self.save_btn.grid(row=1, column=2, padx=20, pady=5)
+
+        self.save_cf_btn = ctk.CTkButton(self.config_frame, text="Save CF Config", command=self.save_cf_config, width=120, fg_color="gray")
+        self.save_cf_btn.grid(row=2, column=2, padx=20, pady=5)
+
+        # Auto-load if token exists
+        if self.token_var.get():
+            self.after(500, self.load_zones)
+
+
+        # --- Middle Section: Subdomain Management ---
+        self.mgmt_frame = ctk.CTkFrame(tab, corner_radius=10)
+        self.mgmt_frame.grid(row=1, column=0, padx=20, pady=10, sticky="nsew")
+        self.mgmt_frame.grid_columnconfigure((1, 3), weight=1)
+
+        ctk.CTkLabel(self.mgmt_frame, text="Add New Record", font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, columnspan=4, padx=20, pady=10, sticky="w")
+
+        ctk.CTkLabel(self.mgmt_frame, text="Subdomain:").grid(row=1, column=0, padx=20, pady=5, sticky="e")
+        self.subdomain_entry = ctk.CTkEntry(self.mgmt_frame, textvariable=self.subdomain_var, placeholder_text="www")
+        self.subdomain_entry.grid(row=1, column=1, padx=(0, 20), pady=5, sticky="ew")
+
+        ctk.CTkLabel(self.mgmt_frame, text="Type:").grid(row=1, column=2, padx=5, pady=5, sticky="e")
+        self.type_combo = ctk.CTkComboBox(self.mgmt_frame, variable=self.type_var, values=["A", "AAAA", "CNAME", "TXT", "MX", "SRV", "NS"], width=100)
+        self.type_combo.grid(row=1, column=3, padx=(0, 20), pady=5, sticky="w")
+
+        ctk.CTkLabel(self.mgmt_frame, text="Content:").grid(row=1, column=4, padx=5, pady=5, sticky="e")
+        self.ip_entry = ctk.CTkEntry(self.mgmt_frame, textvariable=self.ip_var, placeholder_text="1.2.3.4", width=200)
+        self.ip_entry.grid(row=1, column=5, padx=(0, 20), pady=5, sticky="ew")
+
+        # Row 2: TTL, Proxied
+        ctk.CTkLabel(self.mgmt_frame, text="TTL:").grid(row=2, column=0, padx=20, pady=5, sticky="e")
+        self.ttl_combo = ctk.CTkComboBox(self.mgmt_frame, variable=self.ttl_var, values=list(self.ttl_mapping.keys()), width=100)
+        self.ttl_combo.grid(row=2, column=1, padx=(0, 20), pady=5, sticky="w")
+
+        self.proxied_cb = ctk.CTkCheckBox(self.mgmt_frame, text="Proxied", variable=self.proxied_var)
+        self.proxied_cb.grid(row=2, column=2, padx=5, pady=5, sticky="w")
+
+        self.create_btn = ctk.CTkButton(self.mgmt_frame, text="Create Record", command=self.create_record, fg_color="green", hover_color="#006400")
+        self.create_btn.grid(row=2, column=4, padx=5, pady=5)
+
+        self.clear_btn = ctk.CTkButton(self.mgmt_frame, text="Clear", command=self.clear_form, fg_color="gray", width=100)
+        self.clear_btn.grid(row=2, column=5, padx=20, pady=5)
+
+
+        # --- Bottom Section: Records Table ---
+        self.table_frame = ctk.CTkFrame(tab, corner_radius=10)
+        self.table_frame.grid(row=2, column=0, padx=20, pady=(10, 20), sticky="nsew")
+        self.table_frame.grid_columnconfigure(0, weight=1)
+        self.table_frame.grid_rowconfigure(1, weight=1)
+
+        # Toolbar above table
+        self.toolbar = ctk.CTkFrame(self.table_frame, fg_color="transparent")
+        self.toolbar.grid(row=0, column=0, sticky="ew", padx=10, pady=5)
+
+        self.refresh_btn = ctk.CTkButton(self.toolbar, text="Refresh Records", command=self.list_records, width=120)
+        self.refresh_btn.pack(side="left", padx=5)
+
+        self.delete_btn = ctk.CTkButton(self.toolbar, text="Delete Selected", command=self.delete_selected, fg_color="#C0392B", hover_color="#962D22", width=120)
+        self.delete_btn.pack(side="left", padx=5)
+
+        self.export_btn = ctk.CTkButton(self.toolbar, text="Export MikroTik", command=self.export_mikrotik, width=120)
+        self.export_btn.pack(side="right", padx=5)
+
+        # Treeview Styling
+        style = ttk.Style()
+        style.theme_use("default")
+        style.configure("Treeview", 
+                        background="#2b2b2b", 
+                        foreground="white", 
+                        fieldbackground="#2b2b2b", 
+                        borderwidth=0,
+                        font=("SF Pro Display", 11))
+        style.map("Treeview", background=[('selected', '#3498db')])
+        style.configure("Treeview.Heading", 
+                        background="#333333", 
+                        foreground="white", 
+                        relief="flat",
+                        font=("SF Pro Display", 12, "bold"))
+
+        # Treeview
+        columns = ("type", "name", "ip", "record_id")
+        self.tree = ttk.Treeview(self.table_frame, columns=columns, show="headings")
+        self.tree.heading("type", text="Type")
+        self.tree.heading("name", text="Name")
+        self.tree.heading("ip", text="Content / IP")
+        self.tree.heading("record_id", text="Record ID")
+        self.tree.column("type", width=80)
+        self.tree.column("name", width=250)
+        self.tree.column("ip", width=200)
+        self.tree.column("record_id", width=0, stretch=False) # Hide ID, just store it
+        # Note: I'm not showing TTL/Proxied in columns to keep it simple, but we could add them. 
+        # For now, viewing details is done by selecting.
+        self.tree.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.tree.bind("<<TreeviewSelect>>", self.on_record_select)
+
+
+        # Scrollbar
+        self.scrollbar = ctk.CTkScrollbar(self.table_frame, command=self.tree.yview)
+        self.scrollbar.grid(row=1, column=1, sticky="ns", pady=(0, 10))
+        self.tree.configure(yscrollcommand=self.scrollbar.set)
+
+    def setup_s3_tab(self):
+        tab = self.tabview.tab("AWS S3")
+        tab.grid_columnconfigure(0, weight=0, minsize=350)
+        tab.grid_columnconfigure(1, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+
+        # --- Sidebar (Left Column) ---
+        self.sidebar_frame = ctk.CTkFrame(tab, corner_radius=10)
+        self.sidebar_frame.grid(row=0, column=0, padx=(20, 10), pady=20, sticky="nsew")
+        self.sidebar_frame.grid_columnconfigure(0, weight=1)
+        self.sidebar_frame.grid_rowconfigure(2, weight=1) # Bucket table area gets weight
+
+        # 1. AWS Configuration Area
+        self.aws_config_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        self.aws_config_frame.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+        self.aws_config_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(self.aws_config_frame, text="AWS Profiles & Configuration", font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, columnspan=2, padx=10, pady=(0, 10), sticky="w")
+        
+        # Profile Selection Row
+        ctk.CTkLabel(self.aws_config_frame, text="Profile:").grid(row=1, column=0, padx=5, pady=2, sticky="e")
+        self.profile_combo = ctk.CTkComboBox(self.aws_config_frame, variable=self.aws_profile_var, command=self.on_profile_change)
+        self.profile_combo.grid(row=1, column=1, padx=5, pady=2, sticky="ew")
+        
+        # Mini Toolbar for Profile
+        self.prof_tools = ctk.CTkFrame(self.aws_config_frame, fg_color="transparent")
+        self.prof_tools.grid(row=2, column=1, sticky="e")
+        self.save_aws_btn = ctk.CTkButton(self.prof_tools, text="Save", command=self.save_s3_profile_action, width=60, height=24, fg_color="green", hover_color="#006400")
+        self.save_aws_btn.pack(side="right", padx=2)
+        self.delete_profile_btn = ctk.CTkButton(self.prof_tools, text="Delete", command=self.delete_s3_profile_action, width=60, height=24, fg_color="#C0392B", hover_color="#962D22")
+        self.delete_profile_btn.pack(side="right", padx=2)
+
+        # Quick Key/Region Edit
+        ctk.CTkLabel(self.aws_config_frame, text="Access:").grid(row=3, column=0, padx=5, pady=2, sticky="e")
+        self.aws_access_entry = ctk.CTkEntry(self.aws_config_frame, textvariable=self.aws_access_key_var, height=26)
+        self.aws_access_entry.grid(row=3, column=1, padx=5, pady=2, sticky="ew")
+
+        ctk.CTkLabel(self.aws_config_frame, text="Secret:").grid(row=4, column=0, padx=5, pady=2, sticky="e")
+        self.aws_secret_entry = ctk.CTkEntry(self.aws_config_frame, textvariable=self.aws_secret_key_var, height=26, show="*")
+        self.aws_secret_entry.grid(row=4, column=1, padx=5, pady=2, sticky="ew")
+
+        ctk.CTkLabel(self.aws_config_frame, text="Region:").grid(row=5, column=0, padx=5, pady=2, sticky="e")
+        self.aws_region_entry = ctk.CTkEntry(self.aws_config_frame, textvariable=self.aws_region_var, height=26)
+        self.aws_region_entry.grid(row=5, column=1, padx=5, pady=2, sticky="ew")
+
+        self.load_buckets_btn = ctk.CTkButton(self.aws_config_frame, text="Load S3 Buckets", command=self.list_s3_buckets, height=32)
+        self.load_buckets_btn.grid(row=6, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
+
+        # 2. Bucket List Area
+        self.list_container = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        self.list_container.grid(row=1, column=0, rowspan=2, padx=10, pady=(0, 10), sticky="nsew")
+        self.list_container.grid_columnconfigure(0, weight=1)
+        self.list_container.grid_rowconfigure(1, weight=1)
+
+        # Search
+        self.bucket_search_entry = ctk.CTkEntry(self.list_container, textvariable=self.bucket_search_var, placeholder_text="Search buckets...")
+        self.bucket_search_entry.grid(row=0, column=0, padx=0, pady=(0, 5), sticky="ew")
+        self.bucket_search_entry.bind("<KeyRelease>", lambda e: self.filter_buckets())
+
+        # Table
+        self.bucket_table_frame = ctk.CTkFrame(self.list_container)
+        self.bucket_table_frame.grid(row=1, column=0, sticky="nsew")
+        self.bucket_table_frame.grid_columnconfigure(0, weight=1)
+        self.bucket_table_frame.grid_rowconfigure(0, weight=1)
+
+        columns = ("name",)
+        self.bucket_tree = ttk.Treeview(self.bucket_table_frame, columns=columns, show="headings")
+        self.bucket_tree.heading("name", text="Bucket Name")
+        self.bucket_tree.column("name", width=250)
+        self.bucket_tree.grid(row=0, column=0, sticky="nsew")
+        self.bucket_tree.bind("<<TreeviewSelect>>", self.on_bucket_select)
+
+        self.bucket_scrollbar = ctk.CTkScrollbar(self.bucket_table_frame, command=self.bucket_tree.yview)
+        self.bucket_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.bucket_tree.configure(yscrollcommand=self.bucket_scrollbar.set)
+
+        # --- Main Content (Right Column) ---
+        self.main_content_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        self.main_content_frame.grid(row=0, column=1, padx=(10, 20), pady=20, sticky="nsew")
+        self.main_content_frame.grid_columnconfigure(0, weight=1)
+        self.main_content_frame.grid_rowconfigure(1, weight=1)
+
+        # 1. Selection Info & Hosting Actions
+        self.bucket_frame = ctk.CTkFrame(self.main_content_frame, corner_radius=10)
+        self.bucket_frame.grid(row=0, column=0, padx=0, pady=(0, 20), sticky="ew")
+        self.bucket_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(self.bucket_frame, text="Current Bucket Management", font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, columnspan=2, padx=20, pady=10, sticky="w")
+        
+        ctk.CTkLabel(self.bucket_frame, text="Bucket Name:").grid(row=1, column=0, padx=20, pady=5, sticky="e")
+        self.bucket_entry = ctk.CTkEntry(self.bucket_frame, textvariable=self.bucket_name_var, width=300)
+        self.bucket_entry.grid(row=1, column=1, padx=20, pady=5, sticky="w")
+        self.bucket_entry.bind("<KeyPress>", lambda e: self.bucket_tree.selection_remove(self.bucket_tree.selection()))
+
+        self.new_bucket_btn = ctk.CTkButton(self.bucket_frame, text="+ New Bucket", command=self.reset_s3_selection, width=100, fg_color="blue", hover_color="#1a5276")
+        self.new_bucket_btn.grid(row=1, column=2, padx=10, pady=5, sticky="w")
+
+        # Compact Hosting Config
+        self.web_config_frame = ctk.CTkFrame(self.bucket_frame, fg_color="transparent")
+        self.web_config_frame.grid(row=2, column=0, columnspan=2, padx=20, pady=5, sticky="w")
+        
+        self.enable_hosting_cb = ctk.CTkCheckBox(self.web_config_frame, text="Hosting", variable=self.enable_hosting_var, width=100)
+        self.enable_hosting_cb.grid(row=0, column=0, padx=(0, 10))
+        
+        ctk.CTkLabel(self.web_config_frame, text="Idx:").grid(row=0, column=1, padx=2)
+        self.index_entry = ctk.CTkEntry(self.web_config_frame, textvariable=self.index_doc_var, width=80)
+        self.index_entry.grid(row=0, column=2, padx=2)
+        
+        ctk.CTkLabel(self.web_config_frame, text="Err:").grid(row=0, column=3, padx=2)
+        self.error_entry = ctk.CTkEntry(self.web_config_frame, textvariable=self.error_doc_var, width=80)
+        self.error_entry.grid(row=0, column=4, padx=2)
+
+        self.btn_group = ctk.CTkFrame(self.bucket_frame, fg_color="transparent")
+        self.btn_group.grid(row=3, column=0, columnspan=2, padx=20, pady=10, sticky="ew")
+        
+        self.create_bucket_btn = ctk.CTkButton(self.btn_group, text="Apply Web & Policy", command=self.handle_s3_creation, fg_color="green", hover_color="#006400", width=150)
+        self.create_bucket_btn.pack(side="left", padx=5)
+        self.delete_bucket_btn = ctk.CTkButton(self.btn_group, text="Delete Bucket", command=self.delete_bucket_action, fg_color="#C0392B", hover_color="#962D22", width=120)
+        self.delete_bucket_btn.pack(side="left", padx=5)
+
+        # Endpoint strip
+        self.endpoint_frame = ctk.CTkFrame(self.bucket_frame, fg_color="transparent")
+        self.endpoint_frame.grid(row=4, column=0, columnspan=2, padx=20, pady=(0, 15), sticky="ew")
+        ctk.CTkLabel(self.endpoint_frame, text="URL:").pack(side="left", padx=(0, 5))
+        self.main_endpoint_entry = ctk.CTkEntry(self.endpoint_frame, textvariable=self.bucket_endpoint_var, state="readonly")
+        self.main_endpoint_entry.pack(side="left", fill="x", expand=True)
+        self.copy_endpoint_btn = ctk.CTkButton(self.endpoint_frame, text="Copy", width=60, command=self.copy_endpoint)
+        self.copy_endpoint_btn.pack(side="left", padx=5)
+
+        # Cloudflare Quick Link
+        self.cf_link_frame = ctk.CTkFrame(self.bucket_frame, fg_color="transparent")
+        self.cf_link_frame.grid(row=5, column=0, columnspan=2, padx=20, pady=(0, 15), sticky="ew")
+
+        self.cf_link_cb = ctk.CTkCheckBox(self.cf_link_frame, text="Link Cloudflare DNS", variable=self.link_cf_var)
+        self.cf_link_cb.grid(row=0, column=0, padx=(0, 10))
+
+        ctk.CTkLabel(self.cf_link_frame, text="Sub:").grid(row=0, column=1, padx=2)
+        self.cf_subdomain_entry = ctk.CTkEntry(self.cf_link_frame, textvariable=self.cf_subdomain_var, width=120, placeholder_text="e.g. static")
+        self.cf_subdomain_entry.grid(row=0, column=2, padx=2)
+
+        self.cf_proxy_cb = ctk.CTkCheckBox(self.cf_link_frame, text="Proxy", variable=self.cf_proxy_var)
+        self.cf_proxy_cb.grid(row=0, column=3, padx=10)
+        
+        # Visual separator
+        ctk.CTkLabel(self.cf_link_frame, text="|", text_color="gray").grid(row=0, column=4, padx=5)
+
+        self.add_dns_btn = ctk.CTkButton(self.cf_link_frame, text="⚡ Add DNS", command=self.link_dns_manually, width=100, fg_color="#E67E22", hover_color="#D35400")
+        self.add_dns_btn.grid(row=0, column=5, padx=5)
+        # Note: Button will be enabled when bucket is selected
+
+        # 2. Details Tabs
+        self.details_tabview = ctk.CTkTabview(self.main_content_frame, corner_radius=10)
+        self.details_tabview.grid(row=1, column=0, padx=0, pady=0, sticky="nsew")
+        
+        self.details_tabview.add("Objects")
+        self.details_tabview.add("Permissions / Policy")
+        self.details_tabview.add("Public Access Block")
+        self.details_tabview.add("Website Hosting")
+        self.details_tabview.add("CORS")
+        self.details_tabview.add("Versioning")
+        
+        self.setup_bucket_objects_tab()
+        self.setup_bucket_permissions_tab()
+        self.setup_bucket_pab_tab()
+        self.setup_bucket_website_tab()
+        self.setup_bucket_cors_tab()
+        self.setup_bucket_versioning_tab()
+        
+        # Load saved profiles on startup
+        self.load_s3_profiles_into_ui()
+
+
+    def setup_bucket_objects_tab(self):
+        tab = self.details_tabview.tab("Objects")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+        
+        # Toolbar for Objects
+        self.obj_toolbar = ctk.CTkFrame(tab, fg_color="transparent")
+        self.obj_toolbar.grid(row=0, column=0, sticky="ew", padx=10, pady=5)
+        
+        self.upload_btn = ctk.CTkButton(self.obj_toolbar, text="Upload File", command=self.upload_object_action, width=100)
+        self.upload_btn.pack(side="left", padx=5)
+        
+        self.upload_folder_btn = ctk.CTkButton(self.obj_toolbar, text="Upload Folder", command=self.upload_folder_action, width=110, fg_color="#34495E", hover_color="#2C3E50")
+        self.upload_folder_btn.pack(side="left", padx=5)
+        
+        self.download_btn = ctk.CTkButton(self.obj_toolbar, text="Download Selected", command=self.download_object_action, width=120)
+        self.download_btn.pack(side="left", padx=5)
+        
+        self.delete_obj_btn = ctk.CTkButton(self.obj_toolbar, text="Delete Selected", command=self.delete_object_action, fg_color="#C0392B", hover_color="#962D22", width=120)
+        self.delete_obj_btn.pack(side="left", padx=5)
+
+        ctk.CTkLabel(self.obj_toolbar, text="Search:").pack(side="left", padx=(10, 5))
+        self.obj_search_entry = ctk.CTkEntry(self.obj_toolbar, textvariable=self.obj_search_var, width=150, placeholder_text="Filter objects...")
+        self.obj_search_entry.pack(side="left", padx=5)
+        self.obj_search_entry.bind("<KeyRelease>", lambda e: self.filter_objects())
+
+        self.refresh_obj_btn = ctk.CTkButton(self.obj_toolbar, text="Refresh", command=lambda: self.fetch_bucket_details(self.bucket_name_var.get()), width=80)
+        self.refresh_obj_btn.pack(side="right", padx=5)
+
+        # Treeview with hierarchical support (show="tree headings" to display folder tree)
+        columns = ("size", "date")
+        self.obj_tree = ttk.Treeview(tab, columns=columns, show="tree headings")
+        
+        # Configure columns
+        self.obj_tree.heading("#0", text="Name")  # Tree column with icons
+        self.obj_tree.heading("size", text="Size")
+        self.obj_tree.heading("date", text="Date")
+        
+        self.obj_tree.column("#0", width=400, anchor="w")  # Tree column for names with icons
+        self.obj_tree.column("size", width=100, anchor="e")
+        self.obj_tree.column("date", width=180, anchor="w")
+        
+        self.obj_tree.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+        
+        # Store mapping of tree items to S3 keys for operations
+        self.tree_item_to_key = {}
+        
+        self.obj_scrollbar = ctk.CTkScrollbar(tab, command=self.obj_tree.yview)
+        self.obj_scrollbar.grid(row=0, column=1, sticky="ns", pady=10)
+        self.obj_tree.configure(yscrollcommand=self.obj_scrollbar.set)
+
+    def setup_bucket_permissions_tab(self):
+        tab = self.details_tabview.tab("Permissions / Policy")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+        
+        ctk.CTkLabel(tab, text="Bucket Policy (JSON):", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, padx=10, pady=(10, 5), sticky="w")
+        
+        self.policy_text = ctk.CTkTextbox(tab, height=200)
+        self.policy_text.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="nsew")
+
+    def setup_bucket_pab_tab(self):
+        tab = self.details_tabview.tab("Public Access Block")
+        tab.grid_columnconfigure(1, weight=1)
+        
+        self.pab_labels = {}
+        fields = [
+            ("BlockPublicAcls", "Block Public ACLs"),
+            ("IgnorePublicAcls", "Ignore Public ACLs"),
+            ("BlockPublicPolicy", "Block Public Policy"),
+            ("RestrictPublicBuckets", "Restrict Public Buckets")
+        ]
+        
+        for i, (key, label) in enumerate(fields):
+            ctk.CTkLabel(tab, text=f"{label}:").grid(row=i, column=0, padx=20, pady=5, sticky="e")
+            val_var = ctk.StringVar(value="Unknown")
+            self.pab_labels[key] = val_var
+            ctk.CTkLabel(tab, textvariable=val_var, font=ctk.CTkFont(weight="bold")).grid(row=i, column=1, padx=20, pady=5, sticky="w")
+
+    def setup_bucket_website_tab(self):
+        tab = self.details_tabview.tab("Website Hosting")
+        tab.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(tab, text="Status:", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, padx=20, pady=10, sticky="e")
+        ctk.CTkLabel(tab, textvariable=self.website_status_var).grid(row=0, column=1, padx=20, pady=10, sticky="w")
+
+        ctk.CTkLabel(tab, text="Endpoint:", font=ctk.CTkFont(weight="bold")).grid(row=1, column=0, padx=20, pady=10, sticky="e")
+        self.website_endpoint_var = ctk.StringVar(value="-")
+        # Clickable behavior could be added, but for now just text
+        self.website_endpoint_entry = ctk.CTkEntry(tab, textvariable=self.website_endpoint_var, width=400, state="readonly")
+        self.website_endpoint_entry.grid(row=1, column=1, padx=20, pady=10, sticky="w")
+
+        self.enable_website_btn = ctk.CTkButton(tab, text="Enable Website Hosting", command=self.enable_website_hosting_manual, fg_color="green", hover_color="#006400")
+        self.enable_website_btn.grid(row=2, column=0, columnspan=2, padx=20, pady=20)
+
+    def setup_bucket_cors_tab(self):
+        tab = self.details_tabview.tab("CORS")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(2, weight=1)
+        
+        ctk.CTkLabel(tab, text="CORS Configuration (JSON):", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, padx=10, pady=(10, 5), sticky="w")
+        
+        self.cors_text = ctk.CTkTextbox(tab, height=200)
+        self.cors_text.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="nsew")
+        
+        self.save_cors_btn = ctk.CTkButton(tab, text="Save CORS", command=self.save_cors_action, fg_color="green", hover_color="#006400")
+        self.save_cors_btn.grid(row=2, column=0, padx=10, pady=10)
+
+    def setup_bucket_versioning_tab(self):
+        tab = self.details_tabview.tab("Versioning")
+        tab.grid_columnconfigure(1, weight=1)
+        
+        ctk.CTkLabel(tab, text="Versioning Status:", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, padx=20, pady=20, sticky="e")
+        ctk.CTkLabel(tab, textvariable=self.versioning_status_var).grid(row=0, column=1, padx=20, pady=20, sticky="w")
+        
+        self.enable_versioning_btn = ctk.CTkButton(tab, text="Enable Versioning", command=lambda: self.set_versioning_action("Enabled"), fg_color="green", hover_color="#006400")
+        self.enable_versioning_btn.grid(row=1, column=0, padx=20, pady=10)
+        
+        self.disable_versioning_btn = ctk.CTkButton(tab, text="Suspend Versioning", command=lambda: self.set_versioning_action("Suspended"), fg_color="#C0392B", hover_color="#962D22")
+        self.disable_versioning_btn.grid(row=1, column=1, padx=20, pady=10)
+
+
+    def list_s3_buckets(self):
+        access_key = self.aws_access_key_var.get().strip()
+        secret_key = self.aws_secret_key_var.get().strip()
+        region = self.aws_region_var.get().strip()
+
+        if not all([access_key, secret_key]):
+            messagebox.showerror("Error", "Please enter AWS Access Key and Secret Key")
+            return
+
+        self.load_buckets_btn.configure(state="disabled", text="Loading...")
+        self.set_status("Loading S3 buckets...", progress=-1)
+
+        def fetch():
+            try:
+                s3 = S3API(access_key, secret_key, region)
+                res = s3.list_buckets()
+                
+                def update_ui():
+                    self.load_buckets_btn.configure(state="normal", text="Load S3 Buckets")
+                    self.set_status("Buckets loaded", progress=1.0)
+                    if not res["success"]:
+                        messagebox.showerror("S3 Error", f"Failed to list buckets: {res['error']}")
+                        return
+
+                    self.bucket_tree.delete(*self.bucket_tree.get_children())
+                    self.all_buckets = res["buckets"]
+                    for name in self.all_buckets:
+                        self.bucket_tree.insert("", "end", values=(name,))
+                
+                self.after(0, update_ui)
+                
+            except Exception as e:
+                def on_error():
+                    self.load_buckets_btn.configure(state="normal", text="Load S3 Buckets")
+                    self.set_status("Failed to load buckets", progress=1.0)
+                    messagebox.showerror("Error", f"An unexpected error occurred: {str(e)}")
+                self.after(0, on_error)
+
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def filter_buckets(self):
+        query = self.bucket_search_var.get().lower()
+        self.bucket_tree.delete(*self.bucket_tree.get_children())
+        for name in self.all_buckets:
+            if query in name.lower():
+                self.bucket_tree.insert("", "end", values=(name,))
+
+    def on_bucket_select(self, event):
+        selected = self.bucket_tree.selection()
+        if not selected:
+            self.add_dns_btn.configure(state="disabled")
+            return
+            
+        item = selected[0]
+        values = self.bucket_tree.item(item)["values"]
+        bucket_name = values[0]
+        
+        self.bucket_name_var.set(bucket_name)
+        
+        # Auto-fill subdomain by extracting the first part if bucket name is a domain
+        # E.g., "static.example.com" -> "static", "mybucket" -> "mybucket"
+        if "." in bucket_name:
+            # Extract subdomain from domain-formatted bucket name
+            subdomain_part = bucket_name.split(".")[0]
+        else:
+            # Use the entire bucket name if no dots
+            subdomain_part = bucket_name.replace("_", "-").lower()
+        
+        if not self.cf_subdomain_var.get():  # Only auto-fill if empty
+            self.cf_subdomain_var.set(subdomain_part)
+        
+        # Always enable Add DNS button when bucket is selected
+        self.add_dns_btn.configure(state="normal")
+
+        # Fetch details in background
+        self.fetch_bucket_details(bucket_name)
+
+    def reset_s3_selection(self):
+        self.bucket_tree.selection_remove(self.bucket_tree.selection())
+        self.bucket_name_var.set("")
+        self.bucket_endpoint_var.set("-")
+        self.cf_subdomain_var.set("")  # Clear subdomain
+        self.add_dns_btn.configure(state="disabled")  # Disable when no bucket selected
+        
+        # Clear all detail views
+        self.obj_tree.delete(*self.obj_tree.get_children())
+        self.policy_text.delete("1.0", "end")
+        self.cors_text.delete("1.0", "end")
+        self.website_status_var.set("-")
+        self.website_endpoint_var.set("-")
+        self.versioning_status_var.set("-")
+
+    def fetch_bucket_details(self, bucket_name):
+        if not bucket_name:
+            return
+            
+        access_key = self.aws_access_key_var.get().strip()
+        secret_key = self.aws_secret_key_var.get().strip()
+        region = self.aws_region_var.get().strip()
+
+        if not all([access_key, secret_key]):
+            return
+
+        # Show loading state in UI
+        self.refresh_obj_btn.configure(state="disabled", text="...")
+        self.set_status(f"Fetching details for {bucket_name}...", progress=-1)
+
+        def do_fetch():
+            try:
+                s3 = S3API(access_key, secret_key, region)
+                
+                with ThreadPoolExecutor(max_workers=6) as executor:
+                    # Submit all tasks - use hierarchical list for objects
+                    f_objects = executor.submit(s3.list_objects_hierarchical, bucket_name)
+                    f_policy = executor.submit(s3.get_bucket_policy, bucket_name)
+                    f_pab = executor.submit(s3.get_public_access_block, bucket_name)
+                    f_web = executor.submit(s3.get_bucket_website, bucket_name)
+                    f_cors = executor.submit(s3.get_bucket_cors, bucket_name)
+                    f_ver = executor.submit(s3.get_bucket_versioning, bucket_name)
+
+                    # Get results
+                    res_obj = f_objects.result()
+                    res_pol = f_policy.result()
+                    res_pab = f_pab.result()
+                    res_web = f_web.result()
+                    res_cors = f_cors.result()
+                    res_ver = f_ver.result()
+
+                def update_ui():
+                    # 1. Objects - Hierarchical Tree Display
+                    self.obj_tree.delete(*self.obj_tree.get_children())
+                    self.tree_item_to_key = {}
+                    self.all_objects = []
+                    
+                    if res_obj["success"]:
+                        folders_dict = {}  # path -> tree_item_id
+                        
+                        # First, create all folder nodes
+                        for folder in res_obj.get("folders", []):
+                            folder_path = folder["path"]
+                            folder_name = folder["name"]
+                            parent_path = folder.get("parent")
+                            
+                            # Determine parent tree item
+                            parent_id = folders_dict.get(parent_path, "")
+                            
+                            # Insert folder with icon
+                            item_id = self.obj_tree.insert(
+                                parent_id, 
+                                "end", 
+                                text=f"📁 {folder_name}",
+                                values=("", ""),  # Empty size and date for folders
+                                open=False
+                            )
+                            folders_dict[folder_path] = item_id
+                        
+                        # Then, add all files
+                        for file_obj in res_obj.get("files", []):
+                            self.all_objects.append(file_obj)
+                            
+                            file_name = file_obj["Name"]
+                            file_key = file_obj["Key"]
+                            parent_path = file_obj.get("Parent")
+                            
+                            # Get file icon
+                            icon = self.get_file_icon(file_name)
+                            
+                            # Format size and date
+                            size_str = self.format_size(file_obj["Size"])
+                            date_str = self.format_date_nice(file_obj["LastModified"])
+                            
+                            # Determine parent tree item
+                            parent_id = folders_dict.get(parent_path, "")
+                            
+                            # Insert file
+                            item_id = self.obj_tree.insert(
+                                parent_id,
+                                "end",
+                                text=f"{icon} {file_name}",
+                                values=(size_str, date_str)
+                            )
+                            
+                            # Store mapping for operations
+                            self.tree_item_to_key[item_id] = file_key
+
+                    # 2. Policy
+                    self.policy_text.delete("1.0", "end")
+                    if res_pol["success"]:
+                        policy = res_pol["policy"]
+                        if isinstance(policy, str) and policy.startswith("{"):
+                            try:
+                                policy = json.dumps(json.loads(policy), indent=4)
+                            except: pass
+                        self.policy_text.insert("1.0", policy)
+                    else:
+                        self.policy_text.insert("1.0", f"Error: {res_pol.get('error')}")
+
+                    # 3. PAB
+                    if res_pab["success"]:
+                        config = res_pab["config"]
+                        if isinstance(config, dict):
+                            for key in self.pab_labels:
+                                val = config.get(key, "Not set")
+                                self.pab_labels[key].set(str(val))
+                        else:
+                            for var in self.pab_labels.values():
+                                var.set(str(config))
+                    else:
+                        for var in self.pab_labels.values():
+                            var.set("Error fetching")
+
+                    # 4. Website
+                    if res_web["success"]:
+                        if res_web["config"]:
+                            self.website_status_var.set("Enabled")
+                            endpoint = f"http://{bucket_name}.s3-website-{region}.amazonaws.com"
+                            self.website_endpoint_var.set(endpoint)
+                            self.bucket_endpoint_var.set(endpoint)
+                            self.enable_website_btn.configure(text="Update Website Config", fg_color="orange", hover_color="#cc8400")
+                        else:
+                            self.website_status_var.set("Disabled")
+                            self.website_endpoint_var.set("-")
+                            self.bucket_endpoint_var.set("-")
+                            self.enable_website_btn.configure(text="Enable Website Hosting", fg_color="green", hover_color="#006400")
+                    else:
+                        self.website_status_var.set(f"Error: {res_web.get('error')}")
+                        self.website_endpoint_var.set("-")
+                        self.bucket_endpoint_var.set("-")
+                    
+                    # Note: Add DNS button state is controlled by bucket selection only
+
+                    # 5. CORS
+                    self.cors_text.delete("1.0", "end")
+                    if res_cors["success"]:
+                        cors = res_cors["cors"]
+                        self.cors_text.insert("1.0", json.dumps(cors, indent=4))
+                    else:
+                        self.cors_text.insert("1.0", f"Error: {res_cors.get('error')}")
+
+                    # 6. Versioning
+                    if res_ver["success"]:
+                        self.versioning_status_var.set(res_ver["status"])
+                    else:
+                        self.versioning_status_var.set("Error")
+
+                    # End loading state
+                    self.refresh_obj_btn.configure(state="normal", text="Refresh")
+                    self.set_status(f"Bucket {bucket_name} details loaded", progress=1.0)
+
+                self.after(0, update_ui)
+
+            except Exception as e:
+                def on_error():
+                    self.refresh_obj_btn.configure(state="normal", text="Refresh")
+                    self.set_status("Error fetching bucket details", progress=1.0)
+                    print(f"Error fetching details: {e}")
+                self.after(0, on_error)
+
+        threading.Thread(target=do_fetch, daemon=True).start()
+
+    def filter_objects(self):
+        """Filter objects in tree view"""
+        query = self.obj_search_var.get().lower()
+        if not query:
+            # Refresh to show all
+            self.fetch_bucket_details(self.bucket_name_var.get())
+            return
+        
+        # Simple filter: only show files matching query
+        self.obj_tree.delete(*self.obj_tree.get_children())
+        self.tree_item_to_key = {}
+        
+        for file_obj in self.all_objects:
+            if query in file_obj["Name"].lower() or query in file_obj["Key"].lower():
+                icon = self.get_file_icon(file_obj["Name"])
+                size_str = self.format_size(file_obj["Size"])
+                date_str = self.format_date_nice(file_obj["LastModified"])
+                
+                item_id = self.obj_tree.insert(
+                    "",
+                    "end",
+                    text=f"{icon} {file_obj['Name']}",
+                    values=(size_str, date_str)
+                )
+                self.tree_item_to_key[item_id] = file_obj["Key"]
+
+    def enable_website_hosting_manual(self):
+        access_key = self.aws_access_key_var.get().strip()
+        secret_key = self.aws_secret_key_var.get().strip()
+        region = self.aws_region_var.get().strip()
+        bucket_name = self.bucket_name_var.get().strip()
+        
+        if not bucket_name:
+            messagebox.showwarning("Warning", "Please select a bucket first")
+            return
+            
+        try:
+            s3 = S3API(access_key, secret_key, region)
+            index = self.index_doc_var.get().strip() or "index.html"
+            error = self.error_doc_var.get().strip() or "404.html"
+            res = s3.enable_website_hosting(bucket_name, index=index, error=error)
+            
+            if res["success"]:
+                messagebox.showinfo("Success", f"Static Website Hosting enabled for {bucket_name}")
+                self.fetch_bucket_details(bucket_name) # Refresh
+            else:
+                messagebox.showerror("Error", f"Failed to enable hosting: {res['error']}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Unexpected error: {str(e)}")
+
+    def copy_endpoint(self):
+        endpoint = self.bucket_endpoint_var.get()
+        if endpoint and endpoint != "-":
+            pyperclip.copy(endpoint)
+            messagebox.showinfo("Copied", "Endpoint copied to clipboard!")
+        else:
+            messagebox.showwarning("Warning", "No endpoint to copy")
+
+    def get_file_icon(self, filename):
+        """Return icon/emoji based on file type"""
+        if not filename:
+            return "📄"
+        
+        ext = filename.lower().split('.')[-1] if '.' in filename else ''
+        
+        icon_map = {
+            # Web
+            'html': '🌐',
+            'htm': '🌐',
+            'css': '🎨',
+            'js': '📜',
+            # Documents
+            'pdf': '📕',
+            'doc': '📘',
+            'docx': '📘',
+            'txt': '📝',
+            'md': '📝',
+            'readme': '📝',
+            # Images
+            'png': '🖼️',
+            'jpg': '🖼️',
+            'jpeg': '🖼️',
+            'gif': '🖼️',
+            'svg': '🖼️',
+            'ico': '🖼️',
+            # Config
+            'json': '⚙️',
+            'xml': '⚙️',
+            'yaml': '⚙️',
+            'yml': '⚙️',
+            'config': '⚙️',
+            # Code
+            'py': '🐍',
+            'java': '☕',
+            'cpp': '⚡',
+            'c': '⚡',
+            # Archives
+            'zip': '📦',
+            'tar': '📦',
+            'gz': '📦',
+            'rar': '📦',
+        }
+        
+        return icon_map.get(ext, '📄')
+    
+    def format_date_nice(self, date_obj):
+        """Format date nicely like 'Saturday, 27 Dec'"""
+        import datetime
+        if isinstance(date_obj, str):
+            try:
+                date_obj = datetime.datetime.strptime(date_obj, "%Y-%m-%d %H:%M:%S")
+            except:
+                return date_obj
+        
+        if isinstance(date_obj, datetime.datetime):
+            return date_obj.strftime("%A, %d %b")
+        return str(date_obj)
+
+    def format_size(self, size_bytes):
+        if size_bytes == 0: return "0 B"
+        size_name = ("B", "KB", "MB", "GB", "TB")
+        import math
+        i = int(math.floor(math.log(size_bytes, 1024)))
+        p = math.pow(1024, i)
+        s = round(size_bytes / p, 2)
+        return "%s %s" % (s, size_name[i])
+
+    def upload_object_action(self):
+        bucket_name = self.bucket_name_var.get().strip()
+        if not bucket_name:
+            messagebox.showwarning("Warning", "Please select a bucket first")
+            return
+        
+        file_path = filedialog.askopenfilename()
+        if not file_path:
+            return
+            
+        import os
+        object_name = os.path.basename(file_path)
+        
+        access_key = self.aws_access_key_var.get().strip()
+        secret_key = self.aws_secret_key_var.get().strip()
+        region = self.aws_region_var.get().strip()
+        
+        self.upload_btn.configure(state="disabled", text="Uploading...")
+        self.set_status(f"Uploading {object_name}...", progress=-1)
+
+        def do_upload():
+            try:
+                s3 = S3API(access_key, secret_key, region)
+                res = s3.upload_file(bucket_name, file_path, object_name)
+                
+                def update_ui():
+                    self.upload_btn.configure(state="normal", text="Upload File")
+                    if res["success"]:
+                        self.set_status(f"Uploaded {object_name}", progress=1.0)
+                        messagebox.showinfo("Success", f"Uploaded {object_name}")
+                        self.fetch_bucket_details(bucket_name)
+                    else:
+                        self.set_status("Upload failed", progress=1.0)
+                        messagebox.showerror("Error", f"Upload failed: {res['error']}")
+                self.after(0, update_ui)
+            except Exception as e:
+                def on_error():
+                    self.upload_btn.configure(state="normal", text="Upload File")
+                    self.set_status("Error during upload", progress=1.0)
+                    messagebox.showerror("Error", str(e))
+                self.after(0, on_error)
+
+        threading.Thread(target=do_upload, daemon=True).start()
+
+    def upload_folder_action(self):
+        # ... logic ...
+        bucket_name = self.bucket_name_var.get().strip()
+        if not bucket_name:
+            messagebox.showwarning("Warning", "Please select a bucket first")
+            return
+        
+        dir_path = filedialog.askdirectory()
+        if not dir_path:
+            return
+            
+        access_key = self.aws_access_key_var.get().strip()
+        secret_key = self.aws_secret_key_var.get().strip()
+        region = self.aws_region_var.get().strip()
+        
+        self.upload_folder_btn.configure(state="disabled", text="Uploading...")
+        self.set_status(f"Starting folder upload: {os.path.basename(dir_path)}...", progress=-1)
+
+        def do_upload():
+            try:
+                s3 = S3API(access_key, secret_key, region)
+                
+                def progress_cb(msg):
+                    self.set_status(msg, progress=-1)
+                
+                res = s3.upload_directory(bucket_name, dir_path, progress_callback=progress_cb)
+                
+                def update_ui():
+                    self.upload_folder_btn.configure(state="normal", text="Upload Folder")
+                    if res["success"]:
+                        self.set_status(f"Folder upload complete", progress=1.0)
+                        messagebox.showinfo("Success", f"Folder uploaded successfully to {bucket_name}")
+                        self.fetch_bucket_details(bucket_name)
+                    else:
+                        self.set_status("Folder upload failed", progress=1.0)
+                        messagebox.showerror("Error", f"Folder upload failed: {res['error']}")
+                self.after(0, update_ui)
+            except Exception as e:
+                def on_error():
+                    self.upload_folder_btn.configure(state="normal", text="Upload Folder")
+                    self.set_status("Error during folder upload", progress=1.0)
+                    messagebox.showerror("Error", str(e))
+                self.after(0, on_error)
+
+        threading.Thread(target=do_upload, daemon=True).start()
+
+    def download_object_action(self):
+        selected = self.obj_tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "Please select an object to download")
+            return
+        
+        selected_item = selected[0]
+        
+        # Check if it's a file (not a folder)
+        if selected_item not in self.tree_item_to_key:
+            messagebox.showwarning("Warning", "Cannot download folders. Please select a file.")
+            return
+            
+        bucket_name = self.bucket_name_var.get().strip()
+        object_name = self.tree_item_to_key[selected_item]
+        
+        # Extract filename for save dialog
+        filename = object_name.split('/')[-1]
+        
+        file_path = filedialog.asksaveasfilename(initialfile=filename)
+        if not file_path:
+            return
+            
+        access_key = self.aws_access_key_var.get().strip()
+        secret_key = self.aws_secret_key_var.get().strip()
+        region = self.aws_region_var.get().strip()
+        
+        try:
+            s3 = S3API(access_key, secret_key, region)
+            res = s3.download_file(bucket_name, object_name, file_path)
+            if res["success"]:
+                messagebox.showinfo("Success", f"Downloaded {object_name}")
+            else:
+                messagebox.showerror("Error", f"Download failed: {res['error']}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def delete_object_action(self):
+        selected = self.obj_tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "Please select an object to delete")
+            return
+        
+        selected_item = selected[0]
+        
+        # Check if it's a file (not a folder)
+        if selected_item not in self.tree_item_to_key:
+            messagebox.showwarning("Warning", "Cannot delete folders directly. Please delete files individually.")
+            return
+            
+        bucket_name = self.bucket_name_var.get().strip()
+        object_name = self.tree_item_to_key[selected_item]
+        
+        if not messagebox.askyesno("Confirm", f"Are you sure you want to delete {object_name}?"):
+            return
+            
+        access_key = self.aws_access_key_var.get().strip()
+        secret_key = self.aws_secret_key_var.get().strip()
+        region = self.aws_region_var.get().strip()
+        
+        try:
+            s3 = S3API(access_key, secret_key, region)
+            res = s3.delete_object(bucket_name, object_name)
+            if res["success"]:
+                messagebox.showinfo("Success", f"Deleted {object_name}")
+                self.fetch_bucket_details(bucket_name)
+            else:
+                messagebox.showerror("Error", f"Delete failed: {res['error']}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def save_cors_action(self):
+        bucket_name = self.bucket_name_var.get().strip()
+        if not bucket_name:
+            messagebox.showwarning("Warning", "Please select a bucket first")
+            return
+            
+        cors_json = self.cors_text.get("1.0", "end").strip()
+        try:
+            cors_rules = json.loads(cors_json)
+            
+            access_key = self.aws_access_key_var.get().strip()
+            secret_key = self.aws_secret_key_var.get().strip()
+            region = self.aws_region_var.get().strip()
+            
+            s3 = S3API(access_key, secret_key, region)
+            res = s3.put_bucket_cors(bucket_name, cors_rules)
+            if res["success"]:
+                messagebox.showinfo("Success", "CORS policy updated")
+                self.fetch_bucket_details(bucket_name)
+            else:
+                messagebox.showerror("Error", f"Update failed: {res['error']}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Invalid JSON or API error: {str(e)}")
+
+    def set_versioning_action(self, status):
+        bucket_name = self.bucket_name_var.get().strip()
+        if not bucket_name:
+            messagebox.showwarning("Warning", "Please select a bucket first")
+            return
+            
+        access_key = self.aws_access_key_var.get().strip()
+        secret_key = self.aws_secret_key_var.get().strip()
+        region = self.aws_region_var.get().strip()
+        
+        try:
+            s3 = S3API(access_key, secret_key, region)
+            res = s3.put_bucket_versioning(bucket_name, status)
+            if res["success"]:
+                messagebox.showinfo("Success", f"Versioning {status.lower()}")
+                self.fetch_bucket_details(bucket_name)
+            else:
+                messagebox.showerror("Error", f"Update failed: {res['error']}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def delete_bucket_action(self):
+        bucket_name = self.bucket_name_var.get().strip()
+        if not bucket_name:
+            messagebox.showwarning("Warning", "Please select a bucket first")
+            return
+            
+        if not messagebox.askyesno("Confirm", f"ARE YOU SURE? This will delete the bucket '{bucket_name}'."):
+            return
+            
+        access_key = self.aws_access_key_var.get().strip()
+        secret_key = self.aws_secret_key_var.get().strip()
+        region = self.aws_region_var.get().strip()
+        
+        try:
+            s3 = S3API(access_key, secret_key, region)
+            res = s3.delete_bucket(bucket_name)
+            if res["success"]:
+                messagebox.showinfo("Success", f"Bucket '{bucket_name}' deleted.")
+                self.list_s3_buckets()
+                self.bucket_name_var.set("")
+            else:
+                messagebox.showerror("Error", f"Delete failed: {res['error']}. Bucket MUST be empty before deletion.")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def handle_s3_creation(self):
+        access_key = self.aws_access_key_var.get().strip()
+        secret_key = self.aws_secret_key_var.get().strip()
+        region = self.aws_region_var.get().strip()
+        bucket_name = self.bucket_name_var.get().strip()
+
+        if not all([access_key, secret_key, region, bucket_name]):
+            messagebox.showerror("Error", "Please fill in all AWS fields and Bucket Name")
+            return
+
+        # Note: Profile is auto-saved on manual save only, not during bucket creation
+        self.create_bucket_btn.configure(state="disabled", text="Processing...")
+        self.set_status(f"Starting creation for {bucket_name}...", progress=0.1)
+
+        def do_work():
+            success_msg = []
+            error_occured = False
+            
+            try:
+                s3 = S3API(access_key, secret_key, region)
+                
+                # 1. Create Bucket
+                self.set_status(f"Creating bucket {bucket_name}...", progress=0.3)
+                res = s3.create_bucket(bucket_name, region)
+                if res["success"]:
+                    success_msg.append(f"- Bucket '{bucket_name}' created.")
+                elif "BucketAlreadyOwnedByYou" in res["error"] or "BucketAlreadyExists" in res["error"]:
+                    success_msg.append(f"- Bucket '{bucket_name}' already exists (using existing).")
+                else:
+                    # Only fail if it's a real error, not "already exists"
+                    self.after(0, lambda err=res['error']: messagebox.showerror("S3 Error", f"Failed to create bucket: {err}"))
+                    error_occured = True
+
+                # 2. Always Disable Block Public Access (required for website hosting)
+                if not error_occured:
+                    self.set_status("Disabling Block Public Access...", progress=0.5)
+                    res = s3.disable_public_access_block(bucket_name)
+                    if res["success"]:
+                        success_msg.append("- Block Public Access disabled (content is publicly readable).")
+                    else:
+                        self.after(0, lambda err=res['error']: messagebox.showerror("S3 Error", f"Failed to disable Public Access Block: {err}"))
+                        error_occured = True
+                
+                # 3. Always Set Public Read Policy (required for website hosting)
+                if not error_occured:
+                    self.set_status("Setting Public Read Policy...", progress=0.7)
+                    res = s3.set_public_read_policy(bucket_name)
+                    if res["success"]:
+                        success_msg.append("- Public Read Policy applied (all objects are publicly accessible).")
+                    else:
+                        self.after(0, lambda err=res['error']: messagebox.showerror("S3 Error", f"Failed to set policy: {err}"))
+                        error_occured = True
+
+                if not error_occured and self.enable_hosting_var.get():
+                    # 4. Enable Website Hosting
+                    self.set_status("Enabling Static Website Hosting...", progress=0.8)
+                    index = self.index_doc_var.get().strip() or "index.html"
+                    error = self.error_doc_var.get().strip() or "404.html"
+                    res = s3.enable_website_hosting(bucket_name, index=index, error=error)
+                    if not res["success"]:
+                        self.after(0, lambda: messagebox.showerror("S3 Error", f"Failed to enable Website Hosting: {res['error']}"))
+                        error_occured = True
+                    else:
+                        endpoint = f"http://{bucket_name}.s3-website-{region}.amazonaws.com"
+                        self.after(0, lambda: self.bucket_endpoint_var.set(endpoint))
+                        self.after(0, lambda: self.website_endpoint_var.set(endpoint))
+                        success_msg.append("- Static Website Hosting enabled.")
+
+                if not error_occured and self.link_cf_var.get():
+                    # 5. Cloudflare Integration
+                    subdomain = self.cf_subdomain_var.get().strip()
+                    if not subdomain:
+                        success_msg.append("- Cloudflare Linking: Skipped (no subdomain).")
+                    else:
+                        self.set_status(f"Creating Cloudflare DNS '{subdomain}'...", progress=0.9)
+                        try:
+                            if not self.api:
+                                # Run init_api logic in thread
+                                domain = self.domain_var.get().strip()
+                                token = self.token_var.get().strip()
+                                if domain and token and domain != "Please enter API token...":
+                                    self.api = CloudflareAPI(token)
+                                    self.zone_id = self.api.get_zone_id(domain)
+                            
+                            if not self.api or not self.zone_id:
+                                success_msg.append("- Cloudflare Linking: Failed (Missing CF config).")
+                            else:
+                                endpoint = f"{bucket_name}.s3-website-{region}.amazonaws.com"
+                                res_cf = self.api.create_dns_record(
+                                    zone_id=self.zone_id,
+                                    type="CNAME",
+                                    name=subdomain,
+                                    content=endpoint,
+                                    proxied=self.cf_proxy_var.get()
+                                )
+                                
+                                if res_cf.get("success"):
+                                    success_msg.append(f"- DNS CNAME '{subdomain}' created.")
+                                else:
+                                    err = res_cf.get("errors", [{"message": "Unknown error"}])[0]["message"]
+                                    success_msg.append(f"- Cloudflare Error: {err}")
+                        except Exception as e:
+                            success_msg.append(f"- Cloudflare Error: {str(e)}")
+
+                def finalize():
+                    self.create_bucket_btn.configure(state="normal", text="Apply Web & Policy")
+                    self.list_s3_buckets()
+                    if not error_occured:
+                        self.set_status("Bucket creation successful", progress=1.0)
+                        final_text = "Action Completed Successfully:\n" + "\n".join(success_msg)
+                        messagebox.showinfo("Success", final_text)
+                    else:
+                        self.set_status("Errors occurred during creation", progress=1.0)
+                
+                self.after(0, finalize)
+
+            except Exception as e:
+                self.after(0, lambda: self.create_bucket_btn.configure(state="normal", text="Apply Web & Policy"))
+                self.after(0, lambda: messagebox.showerror("Error", f"An unexpected error occurred: {str(e)}"))
+
+        threading.Thread(target=do_work, daemon=True).start()
+
+    def link_dns_manually(self):
+        bucket_name = self.bucket_name_var.get().strip()
+        subdomain = self.cf_subdomain_var.get().strip()
+        endpoint = self.bucket_endpoint_var.get().strip()
+        
+        if not bucket_name:
+            messagebox.showwarning("Warning", "Please select a bucket first.")
+            return
+            
+        if not subdomain:
+            messagebox.showwarning("Warning", "Please enter a subdomain.")
+            return
+
+        self.add_dns_btn.configure(state="disabled", text="Checking...")
+        self.set_status(f"Checking DNS record '{subdomain}'...", progress=0.3)
+
+        def do_link():
+            try:
+                # Initialize API if needed
+                if not self.api:
+                    domain = self.domain_var.get().strip()
+                    token = self.token_var.get().strip()
+                    if domain and token and domain != "Please enter API token...":
+                        self.api = CloudflareAPI(token)
+                        self.zone_id = self.api.get_zone_id(domain)
+                
+                if not self.api or not self.zone_id:
+                    def cf_error():
+                        self.set_status("Cloudflare config missing", progress=1.0)
+                        messagebox.showerror("Cloudflare Error", "Cloudflare API not initialized. Check your token and domain settings.")
+                        self.add_dns_btn.configure(state="normal", text="⚡ Add DNS")
+                    self.after(0, cf_error)
+                    return
+
+                # Determine hostname/content based on endpoint availability
+                if endpoint and endpoint != "-":
+                    # Use website endpoint if available
+                    hostname = endpoint.replace("http://", "").replace("https://", "").split("/")[0]
+                else:
+                    # Use S3 bucket domain directly
+                    region = self.aws_region_var.get().strip() or "us-east-1"
+                    hostname = f"{bucket_name}.s3.{region}.amazonaws.com"
+                
+                # Build full subdomain name
+                domain = self.domain_var.get().strip()
+                full_name = f"{subdomain}.{domain}" if subdomain else domain
+                
+                # Check if DNS record already exists
+                self.set_status(f"Checking if '{full_name}' exists...", progress=0.5)
+                existing_records = self.api.list_dns_records(self.zone_id)
+                matching_record = next((r for r in existing_records if r.get("name") == full_name and r.get("type") == "CNAME"), None)
+                
+                if matching_record:
+                    # Record exists
+                    existing_content = matching_record.get("content", "")
+                    def record_exists():
+                        self.add_dns_btn.configure(state="normal", text="⚡ Add DNS")
+                        self.set_status(f"DNS record already exists", progress=1.0)
+                        messagebox.showinfo("DNS Already Exists", 
+                            f"DNS record '{full_name}' already exists.\n\n"
+                            f"Current target: {existing_content}\n"
+                            f"New target would be: {hostname}\n\n"
+                            f"No changes were made.")
+                    self.after(0, record_exists)
+                    return
+                
+                # Record doesn't exist, create it
+                self.set_status(f"Creating DNS '{subdomain}'...", progress=0.7)
+                res = self.api.create_dns_record(
+                    zone_id=self.zone_id,
+                    type="CNAME",
+                    name=subdomain,
+                    content=hostname,
+                    proxied=self.cf_proxy_var.get()
+                )
+                
+                def finalize():
+                    self.add_dns_btn.configure(state="normal", text="⚡ Add DNS")
+                    if res.get("success"):
+                        self.set_status(f"DNS '{subdomain}' created successfully", progress=1.0)
+                        messagebox.showinfo("Success", 
+                            f"✅ CNAME record created!\n\n"
+                            f"Name: {full_name}\n"
+                            f"Points to: {hostname}\n"
+                            f"Proxied: {'Yes' if self.cf_proxy_var.get() else 'No'}")
+                    else:
+                        err = res.get("errors", [{"message": "Unknown error"}])[0]["message"]
+                        self.set_status("DNS creation failed", progress=1.0)
+                        messagebox.showerror("Cloudflare Error", f"Failed to create DNS record: {err}")
+                self.after(0, finalize)
+
+            except Exception as e:
+                def on_error():
+                    self.add_dns_btn.configure(state="normal", text="⚡ Add DNS")
+                    self.set_status("Unexpected error during DNS link", progress=1.0)
+                    messagebox.showerror("Error", str(e))
+                self.after(0, on_error)
+
+        threading.Thread(target=do_link, daemon=True).start()
+
+    def load_zones(self):
+        token = self.token_var.get().strip()
+        if not token:
+            return
+        
+        self.api = CloudflareAPI(token)
+        try:
+            zones = self.api.get_zones()
+            if not zones:
+                self.domain_combo.configure(values=["No domains found"])
+                return
+            
+            self.zones_data = zones
+            zone_names = [z["name"] for z in zones]
+            self.domain_combo.configure(values=zone_names)
+            
+            # If current domain_var is not in list, pick the first one
+            current_domain = self.domain_var.get()
+            if current_domain not in zone_names:
+                self.domain_var.set(zone_names[0])
+            
+            self.save_cf_config() # Auto save token if load success
+            self.list_records() # Load records for the selected domain
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load zones: {str(e)}")
+
+    def on_domain_change(self, choice):
+        self.save_cf_config()
+        self.list_records()
+
+    def init_api(self):
+
+        domain = self.domain_var.get().strip()
+        token = self.token_var.get().strip()
+        if not domain or not token or domain == "Please enter API token...":
+            messagebox.showerror("Error", "Please enter API Token and select a Domain")
+            return False
+        
+        self.api = CloudflareAPI(token)
+        # Find zone_id from zones_data if possible to avoid API call
+        self.zone_id = next((z["id"] for z in self.zones_data if z["name"] == domain), None)
+        
+        if not self.zone_id:
+            self.zone_id = self.api.get_zone_id(domain)
+            
+        if not self.zone_id:
+            messagebox.showerror("Error", "Zone not found or API error. Check your Token.")
+            return False
+        return True
+
+    def save_cf_config(self):
+        domain = self.domain_var.get().strip()
+        token = self.token_var.get().strip()
+        ConfigManager.save_config(token, domain)
+    
+    def load_s3_profiles_into_ui(self):
+        profiles = ConfigManager.get_s3_profiles()
+        config = ConfigManager.load_config()
+        last_profile = config.get("last_selected_profile", "")
+        
+        names = list(profiles.keys())
+        if not names:
+            names = ["Default"]
+        
+        self.profile_combo.configure(values=names)
+        
+        if last_profile in profiles:
+            self.aws_profile_var.set(last_profile)
+            self.update_aws_fields_from_profile(last_profile)
+        elif names:
+            self.aws_profile_var.set(names[0])
+            self.update_aws_fields_from_profile(names[0])
+            
+    def on_profile_change(self, choice):
+        self.update_aws_fields_from_profile(choice)
+        
+    def update_aws_fields_from_profile(self, profile_name):
+        profiles = ConfigManager.get_s3_profiles()
+        if profile_name in profiles:
+            data = profiles[profile_name]
+            self.aws_access_key_var.set(data.get("aws_access_key", ""))
+            self.aws_secret_key_var.set(data.get("aws_secret_key", ""))
+            self.aws_region_var.set(data.get("aws_region", "us-east-1"))
+            
+    def save_s3_profile_action(self):
+        name = self.aws_profile_var.get().strip()
+        access = self.aws_access_key_var.get().strip()
+        secret = self.aws_secret_key_var.get().strip()
+        region = self.aws_region_var.get().strip()
+        
+        # Validate profile name - only reject empty or exact class names
+        if not name:
+            messagebox.showerror("Error", "Please enter a profile name")
+            return
+        
+        if name in ["CTkComboBox", "CTkEntry", "CTkButton"]:
+            messagebox.showerror("Error", f"Invalid profile name: '{name}'. This appears to be a UI element name.")
+            return
+            
+        ConfigManager.save_s3_profile(name, access, secret, region)
+        self.load_s3_profiles_into_ui()
+        messagebox.showinfo("Success", f"Profile '{name}' saved.")
+        
+    def delete_s3_profile_action(self):
+        name = self.aws_profile_var.get().strip()
+        if not name:
+             return
+             
+        if messagebox.askyesno("Confirm", f"Delete profile '{name}'?"):
+            if ConfigManager.delete_s3_profile(name):
+                self.aws_access_key_var.set("")
+                self.aws_secret_key_var.set("")
+                self.aws_region_var.set("")
+                self.load_s3_profiles_into_ui()
+
+
+    def list_records(self):
+        if not self.init_api():
+            return
+        
+        self.tree.delete(*self.tree.get_children())
+        records = self.api.list_dns_records(self.zone_id)
+        self.current_records = records
+        
+        for record in records:
+            # Maybe show proxied status in name or type? for now just standard
+            self.tree.insert("", "end", values=(record["type"], record["name"], record["content"], record["id"]))
+
+    def on_record_select(self, event):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        
+        values = self.tree.item(selected[0])["values"]
+        self.type_var.set(values[0])
+        
+        # Extract subdomain from full name
+        domain = self.domain_var.get()
+        full_name = values[1]
+        record_id = values[3]
+        
+        if full_name == domain:
+            subdomain = "@"
+        else:
+            subdomain = full_name.replace(f".{domain}", "")
+            
+        self.subdomain_var.set(subdomain)
+        self.ip_var.set(values[2])
+        self.selected_record_id = record_id
+        
+        # Find full record data to set Proxied/TTL
+        record_data = next((r for r in self.current_records if r["id"] == record_id), None)
+        if record_data:
+            self.proxied_var.set(record_data.get("proxied", False))
+            ttl_val = record_data.get("ttl", 1)
+            # Map valid TTL to string
+            ttl_str = self.ttl_reverse_mapping.get(ttl_val, "Auto")
+            self.ttl_var.set(ttl_str)
+
+        self.create_btn.configure(text="Update Record", fg_color="orange", hover_color="#cc8400")
+
+    def clear_form(self):
+        self.subdomain_var.set("")
+        self.ip_var.set("")
+        self.type_var.set("A")
+        self.ttl_var.set("Auto")
+        self.proxied_var.set(False)
+        self.selected_record_id = None
+        self.create_btn.configure(text="Create Record", fg_color="green", hover_color="#006400")
+        self.tree.selection_remove(self.tree.selection())
+
+    def create_record(self):
+        if not self.init_api():
+            return
+        
+        subdomain = self.subdomain_var.get().strip()
+        ip = self.ip_var.get().strip()
+        if not subdomain or not ip:
+            messagebox.showerror("Error", "Please enter both Subdomain and IP")
+            return
+        
+        domain = self.domain_var.get().strip()
+        name = subdomain if subdomain == "@" else f"{subdomain}.{domain}"
+        record_type = self.type_var.get()
+        
+        # Get TTL and Proxied
+        ttl_label = self.ttl_var.get()
+        ttl = self.ttl_mapping.get(ttl_label, 1) # Default to 1 (Auto)
+        proxied = self.proxied_var.get()
+
+        if self.selected_record_id:
+            # Update mode
+            result = self.api.update_dns_record(self.zone_id, self.selected_record_id, record_type, name, ip, ttl=ttl, proxied=proxied)
+            action = "updated"
+        else:
+            # Create mode
+            result = self.api.create_dns_record(self.zone_id, record_type, name, ip, ttl=ttl, proxied=proxied)
+            action = "created"
+
+        if result.get("success"):
+            messagebox.showinfo("Success", f"Record {action} for {name}!")
+            self.list_records()
+            self.clear_form()
+        else:
+            errors = result.get("errors", [])
+            err_msg = "\n".join([f"- {e.get('message')}" for e in errors])
+            messagebox.showerror("API Error", f"Failed to {action[:-1]} record:\n{err_msg}")
+
+
+    def delete_selected(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "Please select a record to delete")
+            return
+        
+        if not messagebox.askyesno("Confirm", "Are you sure you want to delete selected record(s)?"):
+            return
+        
+        if not self.init_api():
+            return
+        
+        for item in selected:
+            values = self.tree.item(item)["values"]
+            rid = values[3]
+            name = values[1]
+            result = self.api.delete_dns_record(self.zone_id, rid)
+
+            if result.get("success"):
+                self.tree.delete(item)
+            else:
+                messagebox.showerror("Error", f"Failed to delete {name}")
+
+    def export_mikrotik(self):
+        records = []
+        for child in self.tree.get_children():
+            values = self.tree.item(child)["values"]
+            records.append(f"/ip dns static add name={values[1]} address={values[2]}")
+
+
+        if not records:
+            messagebox.showwarning("Warning", "No records to export. Refresh the list first.")
+            return
+        
+        script = "\n".join(records)
+        pyperclip.copy(script)
+        
+        export_window = ctk.CTkToplevel(self)
+        export_window.title("MikroTik Script - Copied to Clipboard")
+        export_window.geometry("600x400")
+        
+        ctk.CTkLabel(export_window, text="The following script has been copied to your clipboard:", pady=10).pack()
+        
+        text_area = ctk.CTkTextbox(export_window, width=550, height=300)
+        text_area.insert("1.0", script)
+        text_area.pack(padx=20, pady=10)
+        
+        ctk.CTkButton(export_window, text="Close", command=export_window.destroy).pack(pady=10)
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
